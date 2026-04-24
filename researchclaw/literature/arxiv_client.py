@@ -38,6 +38,8 @@ logger = logging.getLogger(__name__)
 _CB_THRESHOLD = 3
 _CB_INITIAL_COOLDOWN = 180
 _CB_MAX_COOLDOWN = 600
+_RATE_LIMIT_WINDOW_SEC = 300
+_RATE_LIMIT_FAILURES_TO_BLOCK = 6
 
 _CB_CLOSED = "closed"
 _CB_OPEN = "open"
@@ -49,18 +51,51 @@ _cb_cooldown_sec: float = _CB_INITIAL_COOLDOWN
 _cb_open_since: float = 0.0
 _cb_trip_count: int = 0
 _cb_lock = threading.Lock()
+_rate_limit_failures: list[float] = []
+
+
+class ArxivRateLimitExhausted(RuntimeError):
+    """Raised when arXiv keeps returning 429/503 within the failure window."""
 
 
 def _reset_circuit_breaker() -> None:
     """Reset circuit breaker state (for tests)."""
     global _cb_state, _cb_consecutive_429s, _cb_cooldown_sec  # noqa: PLW0603
-    global _cb_open_since, _cb_trip_count  # noqa: PLW0603
+    global _cb_open_since, _cb_trip_count, _rate_limit_failures  # noqa: PLW0603
     with _cb_lock:
         _cb_state = _CB_CLOSED
         _cb_consecutive_429s = 0
         _cb_cooldown_sec = _CB_INITIAL_COOLDOWN
         _cb_open_since = 0.0
         _cb_trip_count = 0
+        _rate_limit_failures = []
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "429" in message
+        or "503" in message
+        or "too many requests" in message
+        or "service unavailable" in message
+    )
+
+
+def _record_rate_limit_failure() -> int:
+    global _rate_limit_failures  # noqa: PLW0603
+    now = time.monotonic()
+    with _cb_lock:
+        _rate_limit_failures = [
+            ts for ts in _rate_limit_failures if now - ts <= _RATE_LIMIT_WINDOW_SEC
+        ]
+        _rate_limit_failures.append(now)
+        return len(_rate_limit_failures)
+
+
+def _clear_rate_limit_failures() -> None:
+    global _rate_limit_failures  # noqa: PLW0603
+    with _cb_lock:
+        _rate_limit_failures = []
 
 
 def _cb_should_allow() -> bool:
@@ -137,6 +172,7 @@ def search_arxiv(
     limit: int = 50,
     sort_by: str = "relevance",
     year_min: int = 0,
+    fail_fast: bool = False,
 ) -> list[Paper]:
     """Search arXiv for papers matching *query*.
 
@@ -162,6 +198,14 @@ def search_arxiv(
         return []
     if not _cb_should_allow():
         logger.info("[rate-limit] arXiv circuit breaker OPEN — skipping")
+        if fail_fast:
+            failures = _record_rate_limit_failure()
+            if failures >= _RATE_LIMIT_FAILURES_TO_BLOCK:
+                raise ArxivRateLimitExhausted(
+                    "arXiv rate-limit retries exhausted "
+                    f"({failures} HTTP 429/503 events or open-circuit skips "
+                    f"in {_RATE_LIMIT_WINDOW_SEC}s)"
+                )
         return []
 
     limit = min(limit, 300)
@@ -189,16 +233,31 @@ def search_arxiv(
                 continue
             papers.append(paper)
         _cb_on_success()
+        _clear_rate_limit_failures()
         logger.info("arXiv: found %d papers for %r", len(papers), query)
     except arxiv.HTTPError as exc:
         logger.warning("arXiv HTTP error: %s", exc)
         _cb_on_failure()
+        if fail_fast and _is_rate_limit_error(exc):
+            failures = _record_rate_limit_failure()
+            if failures >= _RATE_LIMIT_FAILURES_TO_BLOCK:
+                raise ArxivRateLimitExhausted(
+                    "arXiv rate-limit retries exhausted "
+                    f"({failures} HTTP 429/503 events in {_RATE_LIMIT_WINDOW_SEC}s)"
+                )
     except arxiv.UnexpectedEmptyPageError:
         logger.warning("arXiv returned unexpected empty page for %r", query)
         _cb_on_failure()
     except Exception as exc:  # noqa: BLE001
         logger.warning("arXiv search failed: %s", exc)
         _cb_on_failure()
+        if fail_fast and _is_rate_limit_error(exc):
+            failures = _record_rate_limit_failure()
+            if failures >= _RATE_LIMIT_FAILURES_TO_BLOCK:
+                raise ArxivRateLimitExhausted(
+                    "arXiv rate-limit retries exhausted "
+                    f"({failures} HTTP 429/503 events in {_RATE_LIMIT_WINDOW_SEC}s)"
+                )
 
     return papers
 
