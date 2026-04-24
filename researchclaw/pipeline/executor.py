@@ -649,12 +649,15 @@ def execute_stage(
             result = executor(stage_dir, run_dir, config, adapters, llm=llm)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Stage %s failed", stage.name)
+        decision = "retry"
+        if exc.__class__.__name__ == "CodeGenerationTimeout":
+            decision = "blocked"
         result = StageResult(
             stage=stage,
             status=StageStatus.FAILED,
             artifacts=(),
             error=str(exc),
-            decision="retry",
+            decision=decision,
         )
 
     if result.status == StageStatus.DONE:

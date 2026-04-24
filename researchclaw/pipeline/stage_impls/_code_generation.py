@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time as _time
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,47 @@ from researchclaw.pipeline.stages import Stage, StageStatus
 from researchclaw.prompts import PromptManager
 
 logger = logging.getLogger(__name__)
+
+
+class CodeGenerationTimeout(RuntimeError):
+    """Raised when stage-10 code generation exceeds its wall-clock budget."""
+
+
+def _code_generation_stage_budget_sec(config: RCConfig) -> int:
+    """Bound stage-10 wall time so external supervisors do not kill the run first."""
+    base = int(getattr(config.experiment, "time_budget_sec", 0) or 0)
+    return max(300, min(1500, base * 4 if base > 0 else 900))
+
+
+def _call_with_stage_budget(
+    llm: LLMClient,
+    stage_deadline: float,
+    stage_budget_sec: int,
+    callback,
+):
+    """Run one LLM call with the remaining stage budget as its timeout cap."""
+    remaining = int(stage_deadline - _time.monotonic())
+    if remaining < 60:
+        raise CodeGenerationTimeout(
+            f"Stage 10 code generation exceeded wall-clock budget ({stage_budget_sec}s)"
+        )
+
+    cfg = getattr(llm, "config", None)
+    original_timeout = getattr(cfg, "timeout_sec", None)
+    if original_timeout is not None:
+        cfg.timeout_sec = min(int(original_timeout), remaining)
+    try:
+        return callback()
+    except Exception as exc:
+        message = str(exc).lower()
+        if "timed out" in message or "timeout" in message:
+            raise CodeGenerationTimeout(
+                f"Stage 10 code generation exceeded wall-clock budget ({stage_budget_sec}s): {exc}"
+            ) from exc
+        raise
+    finally:
+        if original_timeout is not None:
+            cfg.timeout_sec = original_timeout
 
 # Improvement G: Continuous-action environments that are incompatible with DQN
 _CONTINUOUS_ENVS = {
@@ -78,6 +120,28 @@ def _execute_code_generation(
     max_repair = 5  # BUG-14: Increased from 3 to give more chances for critical bugs
     files: dict[str, str] = {}
     validation_log: list[str] = []
+    stage_budget_sec = _code_generation_stage_budget_sec(config)
+    stage_deadline = _time.monotonic() + stage_budget_sec
+
+    def _budgeted_prompt(*args, **kwargs):
+        if llm is None:
+            raise RuntimeError("LLM unavailable for budgeted prompt call")
+        return _call_with_stage_budget(
+            llm,
+            stage_deadline,
+            stage_budget_sec,
+            lambda: _chat_with_prompt(llm, *args, **kwargs),
+        )
+
+    def _budgeted_chat(*args, **kwargs):
+        if llm is None:
+            raise RuntimeError("LLM unavailable for budgeted chat call")
+        return _call_with_stage_budget(
+            llm,
+            stage_deadline,
+            stage_budget_sec,
+            lambda: llm.chat(*args, **kwargs),
+        )
 
     # --- Detect available packages for sandbox ---
     _pm = prompts or PromptManager()
@@ -572,8 +636,7 @@ def _execute_code_generation(
         if any(config.llm.primary_model.startswith(p) for p in ("gpt-5", "o3", "o4")):
             _code_max_tokens = max(_code_max_tokens, 16384)
 
-        resp = _chat_with_prompt(
-            llm,
+        resp = _budgeted_prompt(
             sp.system,
             sp.user,
             json_mode=sp.json_mode,
@@ -589,8 +652,7 @@ def _execute_code_generation(
                 resp.finish_reason,
                 resp.total_tokens,
             )
-            resp = _chat_with_prompt(
-                llm,
+            resp = _budgeted_prompt(
                 sp.system,
                 sp.user,
                 json_mode=sp.json_mode,
@@ -673,7 +735,7 @@ def _execute_code_generation(
                 issues_text=issues_text,
                 all_files_ctx=all_files_ctx,
             )
-            resp = _chat_with_prompt(llm, rp.system, rp.user)
+            resp = _budgeted_prompt(rp.system, rp.user)
             _repaired = _extract_code_block(resp.content)
             if _repaired.strip():
                 files[fname] = _repaired
@@ -870,8 +932,7 @@ def _execute_code_generation(
             f"Current code:\n{all_code_ctx}\n"
         )
         try:
-            repair_resp = _chat_with_prompt(
-                llm,
+            repair_resp = _budgeted_prompt(
                 _pm.system("code_generation"),
                 repair_prompt,
                 max_tokens=_code_max_tokens,
@@ -947,7 +1008,7 @@ def _execute_code_generation(
             f"8. Are imports consistent? `from X import Y` must use `Y()`, not `X.Y()`.\n"
         )
         try:
-            review_resp = llm.chat(
+            review_resp = _budgeted_chat(
                 [{"role": "user", "content": review_prompt}],
                 system="You are a meticulous ML code reviewer. Be strict.",
                 max_tokens=2048,
@@ -1006,8 +1067,7 @@ def _execute_code_generation(
                         )
                     )
                     try:
-                        fix_resp = _chat_with_prompt(
-                            llm,
+                        fix_resp = _budgeted_prompt(
                             _pm.system("code_generation"),
                             fix_prompt,
                             max_tokens=_code_max_tokens,
@@ -1122,7 +1182,7 @@ def _execute_code_generation(
             "- Are the experimental conditions meaningfully different from each other?\n"
         )
         try:
-            align_resp = llm.chat(
+            align_resp = _budgeted_chat(
                 [{"role": "user", "content": align_prompt}],
                 system="You are a scientific code reviewer checking topic-experiment alignment.",
                 max_tokens=1024,
@@ -1163,8 +1223,7 @@ def _execute_code_generation(
                         f"PLAN:\n{exp_plan}\n\n"
                         f"Return multiple files using ```filename:xxx.py format."
                     )
-                    regen_resp = _chat_with_prompt(
-                        llm,
+                    regen_resp = _budgeted_prompt(
                         system=_pm.system("code_generation"),
                         user=regen_prompt,
                         max_tokens=_code_max_tokens,
@@ -1203,7 +1262,7 @@ def _execute_code_generation(
                         f"# main.py (FULL):\n{_rc_main}\n\n"
                         + "\n".join(_rc_sigs)
                     )
-                    recheck_resp = llm.chat(
+                    recheck_resp = _budgeted_chat(
                         [{"role": "user", "content": (
                             f"Research topic: {config.research.topic}\n\n"
                             f"Experiment code:\n```python\n{recheck_code}\n```\n\n"
@@ -1245,7 +1304,7 @@ def _execute_code_generation(
                 "Answer JSON: "
                 '{"has_duplicates": true/false, "details": "which conditions are identical"}'
             )
-            abl_resp = llm.chat(
+            abl_resp = _budgeted_chat(
                 [{"role": "user", "content": ablation_prompt}],
                 system="You are a code reviewer checking experimental conditions.",
                 max_tokens=512,
@@ -1280,8 +1339,7 @@ def _execute_code_generation(
                     f"Current code:\n{all_code_ctx}\n"
                 )
                 try:
-                    abl_repair_resp = _chat_with_prompt(
-                        llm,
+                    abl_repair_resp = _budgeted_prompt(
                         _pm.system("code_generation"),
                         abl_repair_prompt,
                         max_tokens=_code_max_tokens,

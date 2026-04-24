@@ -2007,6 +2007,62 @@ class TestComputeBudgetBlock:
         assert "60" in all_user_msgs or "Compute Budget" in all_user_msgs
 
 
+def test_code_generation_timeout_helper_raises_when_budget_exhausted() -> None:
+    from researchclaw.pipeline.stage_impls import _code_generation as cg
+
+    llm = FakeLLMClientWithConfig("ok")
+    with pytest.raises(cg.CodeGenerationTimeout):
+        cg._call_with_stage_budget(
+            llm,
+            cg._time.monotonic() - 1,
+            300,
+            lambda: "ok",
+        )
+
+
+def test_code_generation_timeout_helper_wraps_llm_timeout() -> None:
+    from researchclaw.pipeline.stage_impls import _code_generation as cg
+
+    llm = FakeLLMClientWithConfig("ok")
+    with pytest.raises(cg.CodeGenerationTimeout):
+        cg._call_with_stage_budget(
+            llm,
+            cg._time.monotonic() + 300,
+            300,
+            lambda: (_ for _ in ()).throw(RuntimeError("ACP prompt timed out after 120s")),
+        )
+
+
+def test_execute_stage_maps_code_generation_timeout_to_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+    run_dir: Path,
+    rc_config: RCConfig,
+    adapters: AdapterBundle,
+) -> None:
+    from researchclaw.pipeline.stage_impls import _code_generation as cg
+
+    _write_prior_artifact(run_dir, 9, "exp_plan.yaml", "objective: test")
+
+    def raising_executor(*args: object, **kwargs: object):
+        _ = args, kwargs
+        raise cg.CodeGenerationTimeout("Stage 10 code generation exceeded wall-clock budget (300s)")
+
+    monkeypatch.setitem(rc_executor._STAGE_EXECUTORS, Stage.CODE_GENERATION, raising_executor)
+
+    result = rc_executor.execute_stage(
+        Stage.CODE_GENERATION,
+        run_dir=run_dir,
+        run_id="run-codegen-timeout",
+        config=rc_config,
+        adapters=adapters,
+        auto_approve_gates=True,
+    )
+
+    assert result.status == StageStatus.FAILED
+    assert result.decision == "blocked"
+    assert "wall-clock budget" in (result.error or "")
+
+
 class TestPartialTimeoutStatus:
     """Test partial status for timed-out experiments with data (R4-1c)."""
 
