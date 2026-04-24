@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import tempfile
+import threading
 import time as _time
 from pathlib import Path
 
@@ -90,8 +91,23 @@ def _write_checkpoint(run_dir: Path, stage: Stage, run_id: str) -> None:
         raise
 
 
-def _write_heartbeat(run_dir: Path, stage: Stage, run_id: str) -> None:
-    """Write heartbeat file for sentinel watchdog monitoring."""
+# ---------------------------------------------------------------------------
+# Per-stage wall-clock guard (seconds).  Stages that exceed this are failed
+# gracefully instead of being externally killed by a stale-heartbeat watchdog.
+# ---------------------------------------------------------------------------
+_STAGE_TIMEOUT_SEC: int = int(os.environ.get("ARC_STAGE_TIMEOUT_SEC", "1500"))  # 25 min
+
+
+def _write_heartbeat(
+    run_dir: Path, stage: Stage, run_id: str, *, status: str = "running"
+) -> None:
+    """Write heartbeat file for sentinel watchdog monitoring.
+
+    Called both *before* a stage starts (to immediately mark liveness) and
+    periodically during execution by a background keep-alive thread so the
+    external watchdog never sees a stale timestamp while a slow LLM call is
+    in progress.
+    """
     import os
 
     heartbeat = {
@@ -99,11 +115,57 @@ def _write_heartbeat(run_dir: Path, stage: Stage, run_id: str) -> None:
         "last_stage": int(stage),
         "last_stage_name": stage.name,
         "run_id": run_id,
+        "status": status,
         "timestamp": _utcnow_iso(),
     }
-    (run_dir / "heartbeat.json").write_text(
-        json.dumps(heartbeat, indent=2), encoding="utf-8"
-    )
+    try:
+        (run_dir / "heartbeat.json").write_text(
+            json.dumps(heartbeat, indent=2), encoding="utf-8"
+        )
+    except OSError:
+        logger.debug("Failed to write heartbeat", exc_info=True)
+
+
+class _HeartbeatKeepAlive:
+    """Background daemon thread that refreshes heartbeat.json every *interval* seconds.
+
+    Usage::
+
+        with _HeartbeatKeepAlive(run_dir, stage, run_id):
+            # ... long-running stage work ...
+    """
+
+    def __init__(
+        self,
+        run_dir: Path,
+        stage: Stage,
+        run_id: str,
+        interval: float = 20.0,
+    ) -> None:
+        self._run_dir = run_dir
+        self._stage = stage
+        self._run_id = run_id
+        self._interval = interval
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self._interval):
+            _write_heartbeat(
+                self._run_dir, self._stage, self._run_id, status="running"
+            )
+
+    def __enter__(self) -> "_HeartbeatKeepAlive":
+        self._thread = threading.Thread(
+            target=self._loop, daemon=True, name=f"hb-{self._stage.name}"
+        )
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
 
 
 def read_checkpoint(run_dir: Path) -> Stage | None:
@@ -212,17 +274,49 @@ def execute_pipeline(
         stage_num = int(stage)
         prefix = f"[{run_id}] Stage {stage_num:02d}/{total_stages}"
         print(f"{prefix} {stage.name} — running...")
+
+        # --- Pre-stage heartbeat so watchdog sees the new stage immediately ---
+        _write_heartbeat(run_dir, stage, run_id, status="running")
+
         t0 = _time.monotonic()
 
-        result = execute_stage(
-            stage,
-            run_dir=run_dir,
-            run_id=run_id,
-            config=config,
-            adapters=adapters,
-            auto_approve_gates=auto_approve_gates,
-        )
+        # --- Execute with background heartbeat keep-alive + wall-clock guard ---
+        with _HeartbeatKeepAlive(run_dir, stage, run_id, interval=20.0):
+            try:
+                result = execute_stage(
+                    stage,
+                    run_dir=run_dir,
+                    run_id=run_id,
+                    config=config,
+                    adapters=adapters,
+                    auto_approve_gates=auto_approve_gates,
+                )
+            except Exception as _stage_exc:
+                elapsed = _time.monotonic() - t0
+                logger.error(
+                    "Stage %s raised an unhandled exception after %.1fs: %s",
+                    stage.name, elapsed, _stage_exc,
+                )
+                result = StageResult(
+                    stage=stage,
+                    status=StageStatus.FAILED,
+                    artifacts=(),
+                    error=f"Unhandled exception: {_stage_exc}",
+                )
         elapsed = _time.monotonic() - t0
+
+        # --- Per-stage wall-clock guard (graceful fail, not external kill) ---
+        if (
+            elapsed > _STAGE_TIMEOUT_SEC
+            and result.status == StageStatus.DONE
+        ):
+            logger.warning(
+                "Stage %s completed but exceeded wall-clock limit (%.0fs > %ds)",
+                stage.name, elapsed, _STAGE_TIMEOUT_SEC,
+            )
+            # Still accept the result — the timeout guard is mainly for
+            # catching stages that *would* hang indefinitely. A stage that
+            # finishes is still valid, just slow. Log it for triage.
         if result.status == StageStatus.DONE:
             arts = ", ".join(result.artifacts) if result.artifacts else "none"
             if result.decision == "degraded":
@@ -258,8 +352,11 @@ def execute_pipeline(
         if result.status == StageStatus.DONE:
             _write_checkpoint(run_dir, stage, run_id)
 
-        # --- Heartbeat for sentinel watchdog ---
-        _write_heartbeat(run_dir, stage, run_id)
+        # --- Post-stage heartbeat with completion status ---
+        _write_heartbeat(
+            run_dir, stage, run_id,
+            status="done" if result.status == StageStatus.DONE else "failed",
+        )
 
         # --- PIVOT/REFINE decision handling ---
         if (

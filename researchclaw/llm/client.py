@@ -130,6 +130,7 @@ class LLMClient:
             fallback_models=list(rc_config.llm.fallback_models or []),
             fallback_url=fallback_url,
             fallback_api_key=fallback_api_key,
+            timeout_sec=int(getattr(rc_config.llm, "timeout_sec", 300) or 300),
         )
         client = cls(config)
 

@@ -132,6 +132,13 @@ def search_papers(
     list[Paper]
         Merged results, sorted by citation_count descending.
     """
+    # If no Semantic Scholar key is provided, avoid hitting S2 by default.
+    # S2's unauthenticated limits are tight and can trip the circuit breaker,
+    # which stalls the pipeline even though OpenAlex + arXiv are sufficient
+    # for most stages.
+    if (sources == _DEFAULT_SOURCES) and (not s2_api_key.strip()):
+        sources = ("openalex", "arxiv")
+
     all_papers: list[Paper] = []
     cache_get: CacheGet
     cache_put: CachePut

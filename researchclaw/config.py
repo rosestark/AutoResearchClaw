@@ -135,6 +135,7 @@ class LlmConfig:
     fallback_models: tuple[str, ...] = ()
     s2_api_key: str = ""
     notes: str = ""
+    timeout_sec: int = 300
     acp: AcpConfig = field(default_factory=AcpConfig)
 
 
@@ -594,6 +595,7 @@ def _parse_llm_config(data: dict[str, Any]) -> LlmConfig:
         fallback_models=tuple(data.get("fallback_models") or ()),
         s2_api_key=data.get("s2_api_key", ""),
         notes=data.get("notes", ""),
+        timeout_sec=int(data.get("timeout_sec", 300)),
         acp=AcpConfig(
             agent=acp_data.get("agent", "claude"),
             cwd=acp_data.get("cwd", "."),

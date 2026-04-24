@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import textwrap
 import time
 from pathlib import Path
@@ -467,6 +468,33 @@ class TestAcpSessionReconnect:
         assert result == "success response"
         assert call_count == 2
 
+    def test_reconnect_on_queue_owner_disconnect(self):
+        """_send_prompt retries when acpx drops queue ownership mid-prompt."""
+        from researchclaw.llm.acp_client import ACPClient, ACPConfig
+
+        client = ACPClient(ACPConfig(agent="claude"))
+        client._acpx = "/usr/bin/true"
+        client._session_ready = True
+
+        call_count = 0
+
+        def fake_cli(acpx: str, prompt: str) -> str:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError(
+                    "ACP prompt failed (exit 1): [acpx] session demo · /tmp/demo · agent connected\nQueue owner disconnected before prompt completion"
+                )
+            return "success response"
+
+        client._send_prompt_cli = fake_cli  # type: ignore[assignment]
+        client._ensure_session = lambda: None  # type: ignore[assignment]
+        client._force_reconnect = lambda: None  # type: ignore[assignment]
+
+        result = client._send_prompt("test prompt")
+        assert result == "success response"
+        assert call_count == 2
+
     def test_reconnect_exhausted_raises(self):
         """_send_prompt raises after exhausting reconnect attempts."""
         from researchclaw.llm.acp_client import ACPClient, ACPConfig
@@ -508,3 +536,74 @@ class TestAcpSessionReconnect:
         with pytest.raises(RuntimeError, match="permission denied"):
             client._send_prompt("test prompt")
         assert call_count == 1  # no retry
+
+    def test_send_prompt_cli_uses_explicit_prompt_subcommand(self):
+        from researchclaw.llm.acp_client import ACPClient, ACPConfig
+
+        client = ACPClient(
+            ACPConfig(
+                agent="codex",
+                cwd="/tmp/demo",
+                acpx_command="/usr/bin/acpx",
+                session_name="demo-session",
+                timeout_sec=42,
+            )
+        )
+
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="[client] initialize (running)\nOK\n[done] end_turn\n",
+            stderr="",
+        )
+
+        with mock.patch("subprocess.run", return_value=completed) as run_mock:
+            result = client._send_prompt_cli("/usr/bin/acpx", "Reply with OK")
+
+        assert result == "OK"
+        run_mock.assert_called_once_with(
+            [
+                "/usr/bin/acpx", "--approve-all", "--ttl", "0", "--cwd", "/tmp/demo",
+                "codex", "prompt", "-s", "demo-session", "Reply with OK",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=42,
+        )
+
+    def test_send_prompt_via_file_uses_native_file_flag(self):
+        from researchclaw.llm.acp_client import ACPClient, ACPConfig
+
+        client = ACPClient(
+            ACPConfig(
+                agent="codex",
+                cwd="/tmp/demo",
+                acpx_command="/usr/bin/acpx",
+                session_name="demo-session",
+                timeout_sec=42,
+            )
+        )
+
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="[client] initialize (running)\nOK\n[done] end_turn\n",
+            stderr="",
+        )
+
+        with mock.patch("subprocess.run", return_value=completed) as run_mock:
+            result = client._send_prompt_via_file("/usr/bin/acpx", "Reply with OK")
+
+        assert result == "OK"
+        called_args = run_mock.call_args.args[0]
+        assert called_args[:10] == [
+            "/usr/bin/acpx", "--approve-all", "--ttl", "0", "--cwd", "/tmp/demo",
+            "codex", "prompt", "-s", "demo-session",
+        ]
+        assert called_args[10] == "-f"
+        assert called_args[11].startswith("/tmp/rc_prompt_")
+        assert run_mock.call_args.kwargs == {
+            "capture_output": True,
+            "text": True,
+            "timeout": 42,
+        }

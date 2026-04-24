@@ -142,10 +142,28 @@ def _llm_generate(
 
         content = resp.content if hasattr(resp, "content") else str(resp)
 
-        # Parse JSON array from response
-        json_match = re.search(r"\[.*\]", content, re.DOTALL)
-        if json_match:
-            queries = json.loads(json_match.group())
+        candidates: list[str] = []
+        fenced = re.findall(r"```(?:json)?\s*(\[[\s\S]*?\])\s*```", content, re.IGNORECASE)
+        candidates.extend(fenced)
+        if content.strip().startswith('[') and content.strip().endswith(']'):
+            candidates.append(content.strip())
+
+        decoder = json.JSONDecoder()
+        for idx, ch in enumerate(content):
+            if ch != '[':
+                continue
+            try:
+                queries, _end = decoder.raw_decode(content[idx:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(queries, list) and all(isinstance(q, str) for q in queries):
+                candidates.append(json.dumps(queries))
+
+        for raw in candidates:
+            try:
+                queries = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
             if isinstance(queries, list) and all(isinstance(q, str) for q in queries):
                 return queries[:5]
 

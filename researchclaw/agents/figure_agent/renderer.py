@@ -49,6 +49,27 @@ def _docker_available() -> bool:
         return False
 
 
+def _docker_image_available(image: str) -> bool:
+    """Return True if the given Docker image exists locally.
+
+    Avoids pulling from a remote registry — we only want to use the sandbox
+    when it's actually ready to run.  If ``docker image inspect`` exits 0
+    the image is present; anything else (missing image, no daemon, binary
+    not installed) means we cannot safely use the Docker backend and must
+    fall back to the local subprocess renderer.
+    """
+    try:
+        cp = subprocess.run(
+            ["docker", "image", "inspect", image],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        return cp.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
 class RendererAgent(BaseAgent):
     """Executes plotting scripts and verifies output files.
 
@@ -78,9 +99,26 @@ class RendererAgent(BaseAgent):
         self._python = python_path or sys.executable
         self._docker_image = docker_image or _VIZ_DOCKER_IMAGE
 
-        # Auto-detect Docker availability if not explicitly set
+        # Auto-detect Docker availability if not explicitly set.
+        # When auto-detecting, we also require that the target image is
+        # present locally — otherwise every render would fail with
+        # "Unable to find image '<img>' locally" and burn the whole retry
+        # budget before stages 13–15 give up.  In that case we transparently
+        # fall back to the local subprocess backend (matplotlib/numpy from
+        # the host venv) instead of stalling the nightly pipeline.
         if use_docker is None:
-            self._use_docker = _docker_available()
+            if _docker_available() and _docker_image_available(self._docker_image):
+                self._use_docker = True
+            else:
+                self._use_docker = False
+                if _docker_available():
+                    self.logger.warning(
+                        "RendererAgent: Docker reachable but image %s is not "
+                        "available locally — falling back to local subprocess "
+                        "renderer. Build/pull the image to re-enable the "
+                        "sandbox.",
+                        self._docker_image,
+                    )
         else:
             self._use_docker = use_docker
 
@@ -182,6 +220,7 @@ class RendererAgent(BaseAgent):
 
         # Save script for reproducibility
         script_path = scripts_dir / f"{figure_id}.py"
+        original_script_code = script_code
 
         # BUG-60: When running in Docker, rewrite absolute host paths to
         # Docker-mapped paths.  Generated scripts use savefig() with absolute
@@ -209,6 +248,33 @@ class RendererAgent(BaseAgent):
                 output_dir=output_dir,
                 figure_id=figure_id,
             )
+            # Mid-run safety net: if the image vanished or was never pulled,
+            # demote to the local backend for the rest of the run and retry
+            # this figure immediately.  Rewriting the host path above is
+            # harmless for local execution.
+            err = proc_result.get("error", "") or ""
+            if err and (
+                "Unable to find image" in err
+                or "No such image" in err
+                or "manifest unknown" in err
+            ):
+                self.logger.warning(
+                    "Docker image %s unavailable mid-run (%s); switching "
+                    "RendererAgent to local subprocess for remaining "
+                    "figures.",
+                    self._docker_image,
+                    err[:200],
+                )
+                self._use_docker = False
+                # Restore the original script (without the /workspace/output
+                # rewrite) so the local backend can find the figure on disk.
+                script_path.write_text(
+                    original_script_code, encoding="utf-8"
+                )
+                proc_result = self._execute_local(
+                    script_path=script_path,
+                    output_dir=output_dir,
+                )
         else:
             proc_result = self._execute_local(
                 script_path=script_path,

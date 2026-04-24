@@ -2305,6 +2305,27 @@ def _execute_literature_screen(
         topic_keywords[:8],
     )
 
+    # --- Context-window cap before LLM injection ---
+    # codex exec has a ~1MB stdin limit.  Large candidate sets (e.g. 500+
+    # papers with full abstracts) can easily exceed this.  Sort by
+    # keyword_overlap descending and keep the top N most relevant before
+    # building the prompt; the min-shortlist safety valve below still fires
+    # if the LLM returns too few.
+    _MAX_SCREEN_CANDIDATES = 80
+    if len(filtered_rows) > _MAX_SCREEN_CANDIDATES:
+        filtered_rows = sorted(
+            filtered_rows,
+            key=lambda r: r.get("keyword_overlap", 0),
+            reverse=True,
+        )[:_MAX_SCREEN_CANDIDATES]
+        logger.info(
+            "Screen cap: trimmed to top %d candidates to stay under context limit",
+            _MAX_SCREEN_CANDIDATES,
+        )
+    candidates_text = "\n".join(
+        json.dumps(r, ensure_ascii=False) for r in filtered_rows
+    )
+
     shortlist: list[dict[str, Any]] = []
     if llm is not None:
         _pm = prompts or PromptManager()

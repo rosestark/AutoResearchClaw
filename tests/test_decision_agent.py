@@ -400,6 +400,82 @@ class TestNanoBananaNoKey:
 
 
 # =========================================================================
+# RendererAgent Docker image probe + mid-run fallback
+# =========================================================================
+
+class TestDockerImageProbeFallback:
+    """Renderer must not try Docker when the image isn't available locally."""
+
+    def test_auto_detect_falls_back_when_image_missing(self):
+        from researchclaw.agents.figure_agent import renderer as renderer_mod
+
+        with mock.patch.object(renderer_mod, "_docker_available", return_value=True), \
+             mock.patch.object(renderer_mod, "_docker_image_available", return_value=False):
+            agent = renderer_mod.RendererAgent(_FakeLLM(), timeout_sec=5)
+            assert agent._use_docker is False
+
+    def test_auto_detect_uses_docker_when_image_present(self):
+        from researchclaw.agents.figure_agent import renderer as renderer_mod
+
+        with mock.patch.object(renderer_mod, "_docker_available", return_value=True), \
+             mock.patch.object(renderer_mod, "_docker_image_available", return_value=True):
+            agent = renderer_mod.RendererAgent(_FakeLLM(), timeout_sec=5)
+            assert agent._use_docker is True
+
+    def test_explicit_use_docker_skips_image_probe(self):
+        from researchclaw.agents.figure_agent import renderer as renderer_mod
+
+        with mock.patch.object(renderer_mod, "_docker_image_available") as probe:
+            agent = renderer_mod.RendererAgent(
+                _FakeLLM(), timeout_sec=5, use_docker=False
+            )
+            probe.assert_not_called()
+            assert agent._use_docker is False
+
+    def test_midrun_image_missing_demotes_to_local(self, tmp_path):
+        from researchclaw.agents.figure_agent.renderer import RendererAgent
+
+        agent = RendererAgent(_FakeLLM(), timeout_sec=5, use_docker=True)
+        output_dir = tmp_path / "charts"
+        output_dir.mkdir()
+        scripts_dir = output_dir / "scripts"
+        scripts_dir.mkdir()
+
+        docker_err = {
+            "error": (
+                "Docker script failed (exit 125): Unable to find image "
+                "'researchclaw/experiment:latest' locally"
+            )
+        }
+
+        def fake_local(*, script_path, output_dir):
+            # Simulate a successful local run that produces the file.
+            (output_dir / "fig_test.png").write_bytes(
+                b"\x89PNG\r\n\x1a\n" + b"\x00" * 4096
+            )
+            return {"error": ""}
+
+        with mock.patch.object(
+            agent, "_execute_in_docker", return_value=docker_err
+        ) as mock_docker, mock.patch.object(
+            agent, "_execute_local", side_effect=fake_local
+        ) as mock_local:
+            result = agent._render_one(
+                figure_id="fig_test",
+                script_code="print('x')\n",
+                output_filename="fig_test.png",
+                output_dir=output_dir,
+                scripts_dir=scripts_dir,
+            )
+
+        assert mock_docker.call_count == 1
+        assert mock_local.call_count == 1
+        assert agent._use_docker is False, "renderer should demote for rest of run"
+        assert result["success"] is True
+        assert result["error"] == ""
+
+
+# =========================================================================
 # RendererAgent._execute_in_docker() — Docker command construction
 # =========================================================================
 
