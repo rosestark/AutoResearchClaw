@@ -131,7 +131,7 @@ DECISION_ROLLBACK: dict[str, Stage] = {
 }
 
 MAX_DECISION_PIVOTS: int = 2  # Prevent infinite loops
-MAX_DECISION_REFINES: int = 3  # Hard cap for REFINE rollback loops
+MAX_DECISION_REFINES: int = 1  # Hard cap: 1 REFINE cycle keeps total pipeline < 45 min
 
 # ---------------------------------------------------------------------------
 # Noncritical stages — can be skipped on failure without aborting pipeline
