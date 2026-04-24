@@ -649,6 +649,39 @@ class TestArxivCircuitBreaker:
         papers = search_arxiv("test", limit=5)
         assert papers == []
 
+    def test_fail_fast_raises_after_repeated_rate_limits(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Fail-fast mode should raise after repeated arXiv 429/503 pressure."""
+        import types
+
+        from researchclaw.literature import arxiv_client
+
+        _fake_arxiv = types.ModuleType("arxiv")
+
+        class _FakeHTTPError(Exception):
+            pass
+
+        class _FakeUnexpectedEmptyPageError(Exception):
+            pass
+
+        _fake_arxiv.HTTPError = _FakeHTTPError
+        _fake_arxiv.UnexpectedEmptyPageError = _FakeUnexpectedEmptyPageError
+        _fake_arxiv.SortCriterion = MagicMock()
+        _fake_arxiv.SortOrder = MagicMock()
+        _fake_arxiv.Search = MagicMock()
+        monkeypatch.setattr(arxiv_client, "arxiv", _fake_arxiv)
+
+        mock_client = MagicMock()
+        mock_client.results.side_effect = _FakeHTTPError("HTTP 429")
+        monkeypatch.setattr(arxiv_client, "_get_client", lambda: mock_client)
+        monkeypatch.setattr(arxiv_client, "_RATE_LIMIT_FAILURES_TO_BLOCK", 3)
+        arxiv_client._reset_circuit_breaker()
+
+        with pytest.raises(arxiv_client.ArxivRateLimitExhausted):
+            for _ in range(3):
+                search_arxiv("test", limit=5, fail_fast=True)
+
 
 # ──────────────────────────────────────────────────────────────────────
 # OpenAlex client tests

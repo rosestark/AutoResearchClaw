@@ -19,6 +19,7 @@ from researchclaw.pipeline.executor import StageResult, execute_stage
 from researchclaw.pipeline.stages import (
     DECISION_ROLLBACK,
     MAX_DECISION_PIVOTS,
+    MAX_DECISION_REFINES,
     NONCRITICAL_STAGES,
     STAGE_SEQUENCE,
     Stage,
@@ -45,6 +46,55 @@ def _build_pipeline_summary(
     from_stage: Stage,
     run_dir: Path | None = None,
 ) -> dict[str, object]:
+    final_result = results[-1] if results else None
+    degraded = any(r.decision == "degraded" for r in results)
+    final_status = final_result.status.value if final_result is not None else "no_stages"
+    content_metrics = _collect_content_metrics(run_dir)
+    final_decision = next(
+        (
+            item.decision
+            for item in reversed(results)
+            if item.stage == Stage.RESEARCH_DECISION
+        ),
+        "proceed",
+    )
+    stall_reason: str | None = None
+
+    # Fail-closed: degraded + REFINE/PIVOT is not a completed run.
+    if (
+        final_status == "done"
+        and degraded
+        and final_decision in {"refine", "pivot"}
+    ):
+        final_status = "failed"
+        stall_reason = (
+            "degraded pipeline ended with non-terminal research decision "
+            f"({final_decision})"
+        )
+
+    total_citations = content_metrics.get("total_citations")
+    verified_citations = content_metrics.get("verified_citations")
+    if (
+        final_status == "done"
+        and degraded
+        and (total_citations == 0 or verified_citations == 0)
+    ):
+        final_status = "failed"
+        stall_reason = (
+            "degraded pipeline ended with zero citation evidence "
+            f"(total={total_citations}, verified={verified_citations})"
+        )
+
+    # Explicit blocked terminal path (used by loop/rate-limit guards).
+    if (
+        final_result is not None
+        and final_result.status == StageStatus.FAILED
+        and final_result.decision == "blocked"
+    ):
+        final_status = "blocked"
+        if final_result.error:
+            stall_reason = final_result.error
+
     summary: dict[str, object] = {
         "run_id": run_id,
         "stages_executed": len(results),
@@ -58,13 +108,16 @@ def _build_pipeline_summary(
         "stages_failed": sum(
             1 for item in results if item.status == StageStatus.FAILED
         ),
-        "degraded": any(r.decision == "degraded" for r in results),
+        "degraded": degraded,
         "from_stage": int(from_stage),
         "final_stage": int(results[-1].stage) if results else int(from_stage),
-        "final_status": results[-1].status.value if results else "no_stages",
+        "final_status": final_status,
+        "final_decision": final_decision,
         "generated": _utcnow_iso(),
-        "content_metrics": _collect_content_metrics(run_dir),
+        "content_metrics": content_metrics,
     }
+    if stall_reason:
+        summary["stall_reason"] = stall_reason
     return summary
 
 
@@ -686,6 +739,47 @@ def execute_pipeline(
             and result.decision in DECISION_ROLLBACK
         ):
             pivot_count = _read_pivot_count(run_dir)
+            decision_count = _read_decision_count(run_dir, result.decision)
+
+            # Fail-closed cap for REFINE loops.
+            if (
+                result.decision == "refine"
+                and decision_count >= MAX_DECISION_REFINES
+            ):
+                stall_reason = (
+                    "stage-15 refine loop cap reached "
+                    f"({MAX_DECISION_REFINES})"
+                )
+                logger.warning("%s — blocking run", stall_reason)
+                print(f"[{run_id}] BLOCKED: {stall_reason}")
+                blocked_result = StageResult(
+                    stage=result.stage,
+                    status=StageStatus.FAILED,
+                    artifacts=result.artifacts,
+                    error=stall_reason,
+                    decision="blocked",
+                    evidence_refs=result.evidence_refs,
+                )
+                results[-1] = blocked_result
+
+                stage_dir = run_dir / f"stage-{int(stage):02d}"
+                stage_dir.mkdir(parents=True, exist_ok=True)
+                (stage_dir / "stall_reason.txt").write_text(
+                    stall_reason + "\n", encoding="utf-8"
+                )
+                break
+
+            rollback_limit = (
+                MAX_DECISION_REFINES
+                if result.decision == "refine"
+                else MAX_DECISION_PIVOTS
+            )
+            rollback_attempts = (
+                decision_count
+                if result.decision == "refine"
+                else pivot_count
+            )
+
             # R6-4: Skip REFINE if experiment metrics are empty for consecutive cycles
             if pivot_count > 0 and _consecutive_empty_metrics(run_dir, pivot_count):
                 logger.warning(
@@ -697,7 +791,7 @@ def execute_pipeline(
                 # BUG-211: Promote best stage-14 before proceeding with
                 # empty data — an earlier iteration may have real metrics.
                 _promote_best_stage14(run_dir, config)
-            elif pivot_count < MAX_DECISION_PIVOTS:
+            elif rollback_attempts < rollback_limit:
                 rollback_target = DECISION_ROLLBACK[result.decision]
                 _record_decision_history(
                     run_dir, result.decision, rollback_target, pivot_count + 1
@@ -706,13 +800,13 @@ def execute_pipeline(
                     "Decision %s: rolling back to %s (attempt %d/%d)",
                     result.decision.upper(),
                     rollback_target.name,
-                    pivot_count + 1,
-                    MAX_DECISION_PIVOTS,
+                    rollback_attempts + 1,
+                    rollback_limit,
                 )
                 print(
                     f"[{run_id}] Decision: {result.decision.upper()} → "
                     f"rollback to {rollback_target.name} "
-                    f"(attempt {pivot_count + 1}/{MAX_DECISION_PIVOTS})"
+                    f"(attempt {rollback_attempts + 1}/{rollback_limit})"
                 )
                 # Version existing stage directories before overwriting
                 _version_rollback_stages(
@@ -1439,6 +1533,26 @@ def _read_pivot_count(run_dir: Path) -> int:
     except (json.JSONDecodeError, OSError):
         pass
     return 0
+
+
+def _read_decision_count(run_dir: Path, decision: str) -> int:
+    """Read how many times a specific decision has been recorded."""
+    history_path = run_dir / "decision_history.json"
+    if not history_path.exists():
+        return 0
+    try:
+        data = json.loads(history_path.read_text(encoding="utf-8"))
+        if not isinstance(data, list):
+            return 0
+        decision_lower = decision.lower()
+        return sum(
+            1
+            for item in data
+            if isinstance(item, dict)
+            and str(item.get("decision", "")).lower() == decision_lower
+        )
+    except (json.JSONDecodeError, OSError):
+        return 0
 
 
 def _record_decision_history(

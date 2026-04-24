@@ -368,6 +368,7 @@ def _execute_literature_collect(
     real_search_succeeded = False
 
     try:
+        from researchclaw.literature.arxiv_client import ArxivRateLimitExhausted
         from researchclaw.literature.search import (
             search_papers_multi_query,
             papers_to_bibtex,
@@ -401,6 +402,19 @@ def _execute_literature_collect(
             logger.info(
                 "[literature] Found %d papers (%s)", len(papers), src_str
             )
+    except ArxivRateLimitExhausted as exc:
+        stall_reason = (
+            "arXiv backoff exhausted: repeated HTTP 429/503 during literature "
+            f"collection ({exc})"
+        )
+        logger.error("[rate-limit] %s", stall_reason)
+        return StageResult(
+            stage=Stage.LITERATURE_COLLECT,
+            status=StageStatus.FAILED,
+            artifacts=(),
+            error=stall_reason,
+            decision="blocked",
+        )
     except Exception:  # noqa: BLE001
         logger.warning(
             "[rate-limit] Literature search failed — falling back to LLM",

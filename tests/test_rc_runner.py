@@ -404,6 +404,65 @@ def test_build_pipeline_summary_core_fields(
     assert summary["final_stage"] == expected_final_stage
 
 
+def test_pipeline_summary_degraded_refine_is_not_done() -> None:
+    """A degraded run that still wants REFINE must fail closed, not report done."""
+    summary = rc_runner._build_pipeline_summary(
+        run_id="run-degraded-refine",
+        results=[
+            StageResult(
+                stage=Stage.RESEARCH_DECISION,
+                status=StageStatus.DONE,
+                artifacts=("decision.md",),
+                decision="refine",
+            ),
+            StageResult(
+                stage=Stage.QUALITY_GATE,
+                status=StageStatus.DONE,
+                artifacts=("quality_report.json",),
+                decision="degraded",
+            ),
+            _done(Stage.CITATION_VERIFY),
+        ],
+        from_stage=Stage.TOPIC_INIT,
+    )
+    assert summary["degraded"] is True
+    assert summary["final_decision"] == "refine"
+    assert summary["final_status"] != "done"
+    assert "non-terminal research decision" in str(summary["stall_reason"])
+
+
+def test_pipeline_summary_degraded_zero_citations_is_not_done(
+    run_dir: Path,
+) -> None:
+    """A degraded run with zero citation evidence must fail closed."""
+    stage23 = run_dir / "stage-23"
+    stage23.mkdir(parents=True)
+    (stage23 / "verification_report.json").write_text(
+        json.dumps({"summary": {"total": 0, "verified": 0}}),
+        encoding="utf-8",
+    )
+
+    summary = rc_runner._build_pipeline_summary(
+        run_id="run-degraded-zero-citations",
+        results=[
+            StageResult(
+                stage=Stage.QUALITY_GATE,
+                status=StageStatus.DONE,
+                artifacts=("quality_report.json",),
+                decision="degraded",
+            ),
+            _done(Stage.CITATION_VERIFY),
+        ],
+        from_stage=Stage.TOPIC_INIT,
+        run_dir=run_dir,
+    )
+    assert summary["degraded"] is True
+    assert summary["content_metrics"]["total_citations"] == 0
+    assert summary["content_metrics"]["verified_citations"] == 0
+    assert summary["final_status"] != "done"
+    assert "zero citation evidence" in str(summary["stall_reason"])
+
+
 def test_pipeline_prints_stage_progress(
     monkeypatch: pytest.MonkeyPatch,
     run_dir: Path,
@@ -604,6 +663,42 @@ def test_max_pivot_count_prevents_infinite_loop(
     assert decision_count <= MAX_DECISION_PIVOTS + 1
 
 
+def test_max_refine_count_blocks_instead_of_forcing_success(
+    monkeypatch: pytest.MonkeyPatch,
+    run_dir: Path,
+    rc_config: RCConfig,
+    adapters: AdapterBundle,
+) -> None:
+    seen: list[Stage] = []
+
+    def mock_execute_stage(stage: Stage, **kwargs) -> StageResult:
+        _ = kwargs
+        seen.append(stage)
+        if stage == Stage.RESEARCH_DECISION:
+            return _refine_result(stage)
+        return _done(stage)
+
+    monkeypatch.setattr(rc_runner, "execute_stage", mock_execute_stage)
+    results = rc_runner.execute_pipeline(
+        run_dir=run_dir,
+        run_id="run-max-refine",
+        config=rc_config,
+        adapters=adapters,
+    )
+    from researchclaw.pipeline.stages import MAX_DECISION_REFINES
+
+    decision_count = sum(1 for s in seen if s == Stage.RESEARCH_DECISION)
+    assert decision_count == MAX_DECISION_REFINES + 1
+    assert results[-1].stage == Stage.RESEARCH_DECISION
+    assert results[-1].status == StageStatus.FAILED
+    assert results[-1].decision == "blocked"
+    assert "refine loop cap" in (results[-1].error or "")
+
+    summary = json.loads((run_dir / "pipeline_summary.json").read_text())
+    assert summary["final_status"] == "blocked"
+    assert "refine loop cap" in summary["stall_reason"]
+
+
 def test_proceed_decision_does_not_trigger_rollback(
     monkeypatch: pytest.MonkeyPatch,
     run_dir: Path,
@@ -783,11 +878,13 @@ def test_write_checkpoint_preserves_old_on_write_failure(
     original_open = builtins.open
 
     def _exploding_open(path, *args, **kwargs):
-        # After os.close(fd), _write_checkpoint opens via path string —
-        # intercept temp-file opens (checkpoint_*.tmp)
-        if isinstance(path, (str, Path)) and "checkpoint_" in str(path):
-            raise OSError("disk full")
-        if isinstance(path, int):
+        # Intercept the temporary checkpoint write, regardless of whether the
+        # implementation opens by fd or path.
+        if isinstance(path, int) or (
+            isinstance(path, (str, Path))
+            and "checkpoint_" in str(path)
+            and str(path).endswith(".tmp")
+        ):
             raise OSError("disk full")
         return original_open(path, *args, **kwargs)
 

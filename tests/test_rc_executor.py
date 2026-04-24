@@ -590,6 +590,40 @@ def test_stage_executor_mapping_values_are_callable(stage: Stage) -> None:
     assert callable(rc_executor._STAGE_EXECUTORS[stage])
 
 
+def test_literature_collect_arxiv_backoff_exhaustion_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+    run_dir: Path,
+    rc_config: RCConfig,
+    adapters: AdapterBundle,
+) -> None:
+    """arXiv 429/503 exhaustion must terminally block, not degrade to placeholders."""
+    from researchclaw.literature.arxiv_client import ArxivRateLimitExhausted
+
+    def exhausted(*args: object, **kwargs: object) -> list[object]:
+        _ = args, kwargs
+        raise ArxivRateLimitExhausted("six 429/503 responses")
+
+    monkeypatch.setattr(
+        "researchclaw.literature.search.search_papers_multi_query",
+        exhausted,
+    )
+
+    stage_dir = run_dir / "stage-04"
+    stage_dir.mkdir()
+    result = rc_executor._execute_literature_collect(
+        stage_dir,
+        run_dir,
+        rc_config,
+        adapters,
+    )
+
+    assert result.stage == Stage.LITERATURE_COLLECT
+    assert result.status == StageStatus.FAILED
+    assert result.decision == "blocked"
+    assert "arXiv backoff exhausted" in (result.error or "")
+    assert not (stage_dir / "candidates.jsonl").exists()
+
+
 class TestStageHealth:
     def test_stage_health_json_written(self, tmp_path: Path) -> None:
         from researchclaw.pipeline.executor import execute_stage

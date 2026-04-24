@@ -24,7 +24,7 @@ import time
 import urllib.error
 from typing import cast
 
-from researchclaw.literature.arxiv_client import search_arxiv
+from researchclaw.literature.arxiv_client import ArxivRateLimitExhausted, search_arxiv
 from researchclaw.literature.models import Author, Paper
 from researchclaw.literature.openalex_client import search_openalex
 from researchclaw.literature.semantic_scholar import search_semantic_scholar
@@ -177,7 +177,12 @@ def search_papers(
                 time.sleep(1.0)
 
             elif src_lower == "arxiv":
-                papers = search_arxiv(query, limit=limit, year_min=year_min)
+                papers = search_arxiv(
+                    query,
+                    limit=limit,
+                    year_min=year_min,
+                    fail_fast=True,
+                )
                 all_papers.extend(papers)
                 cache_put(query, "arxiv", limit, _papers_to_dicts(papers))
                 source_stats["arxiv"] = len(papers)
@@ -185,6 +190,8 @@ def search_papers(
 
             else:
                 logger.warning("Unknown literature source: %s (skipped)", src)
+        except ArxivRateLimitExhausted:
+            raise
         except (
             OSError,
             RuntimeError,
