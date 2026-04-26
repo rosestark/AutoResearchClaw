@@ -282,6 +282,7 @@ class ACPClient:
         "agent needs reconnect",
         "session not found",
         "Query closed",
+        "Queue owner disconnected before prompt completion",
     )
     _MAX_RECONNECT_ATTEMPTS = 2
 

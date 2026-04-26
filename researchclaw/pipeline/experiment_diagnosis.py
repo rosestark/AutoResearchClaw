@@ -194,6 +194,12 @@ def _select_paper_mode(
     min_seeds: int,
 ) -> PaperMode:
     """Select paper mode based on experiment quality."""
+    # Broken ablation integrity invalidates comparative claims.  Do not let a
+    # condition count/seed count heuristic classify identical conditions as a
+    # full-paper-quality experiment.
+    if any(d.type == DeficiencyType.IDENTICAL_CONDITIONS for d in diagnosis.deficiencies):
+        return PaperMode.TECHNICAL_REPORT
+
     # Check for synthetic data
     if any(d.type == DeficiencyType.SYNTHETIC_DATA_FALLBACK for d in diagnosis.deficiencies):
         return PaperMode.TECHNICAL_REPORT
@@ -597,7 +603,7 @@ def _check_identical_conditions(diag: ExperimentDiagnosis, summary: dict) -> Non
                 affected.extend([m.group(1), m.group(2)])
         diag.deficiencies.append(Deficiency(
             type=DeficiencyType.IDENTICAL_CONDITIONS,
-            severity="major",
+            severity="critical",
             description=(
                 f"{len(warnings)} ablation pair(s) produce identical outputs. "
                 "The differentiating parameter is likely not wired into the code."

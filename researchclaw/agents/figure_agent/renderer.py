@@ -49,6 +49,25 @@ def _docker_available() -> bool:
         return False
 
 
+def _docker_image_available(image: str) -> bool:
+    """Return True if the configured Docker image is already available locally.
+
+    The renderer runs generated plotting code with ``--network none``. Pulling an
+    image during a nightly run is both slow and a frequent source of repeated
+    ``pull access denied`` failures, so preflight only checks local presence.
+    """
+    try:
+        cp = subprocess.run(
+            ["docker", "image", "inspect", image],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        return cp.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
 class RendererAgent(BaseAgent):
     """Executes plotting scripts and verifies output files.
 
@@ -78,23 +97,44 @@ class RendererAgent(BaseAgent):
         self._python = python_path or sys.executable
         self._docker_image = docker_image or _VIZ_DOCKER_IMAGE
 
-        # Auto-detect Docker availability if not explicitly set
+        self._docker_unavailable_reason = ""
+        docker_available = _docker_available()
+        image_available = (
+            _docker_image_available(self._docker_image) if docker_available else False
+        )
+
+        # Auto-detect Docker availability if not explicitly set.  The image
+        # must already exist locally; do not let nightly runs repeatedly try to
+        # pull a private/missing image for every generated figure.
         if use_docker is None:
-            self._use_docker = _docker_available()
+            self._use_docker = docker_available and image_available
+            if docker_available and not image_available:
+                self._docker_unavailable_reason = (
+                    f"Docker image unavailable locally: {self._docker_image}"
+                )
         else:
             self._use_docker = use_docker
+            if use_docker and not docker_available:
+                self._docker_unavailable_reason = "Docker daemon unavailable"
+            elif use_docker and not image_available:
+                self._docker_unavailable_reason = (
+                    f"Docker image unavailable locally: {self._docker_image}"
+                )
 
-        if self._use_docker:
+        if self._use_docker and not self._docker_unavailable_reason:
             self.logger.info(
                 "RendererAgent: Docker sandbox ENABLED (image=%s)",
                 self._docker_image,
             )
         else:
-            self.logger.warning(
+            warning = (
                 "RendererAgent: Docker sandbox DISABLED — LLM-generated "
                 "scripts will run as LOCAL subprocesses WITHOUT sandboxing. "
                 "Set use_docker=True or install Docker for secure execution."
             )
+            if self._docker_unavailable_reason:
+                warning += f" Preflight: {self._docker_unavailable_reason}."
+            self.logger.warning(warning)
 
     # ------------------------------------------------------------------
     # Public API
@@ -109,6 +149,15 @@ class RendererAgent(BaseAgent):
             output_dir (str|Path): Directory for output charts and scripts
         """
         try:
+            if self._use_docker and self._docker_unavailable_reason:
+                return self._make_result(
+                    False,
+                    error=(
+                        "Docker renderer preflight failed: "
+                        f"{self._docker_unavailable_reason}"
+                    ),
+                )
+
             scripts = context.get("scripts", [])
             output_dir = Path(context.get("output_dir", "charts")).resolve()
             output_dir.mkdir(parents=True, exist_ok=True)

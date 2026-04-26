@@ -50,15 +50,30 @@ def _build_pipeline_summary(
     degraded = any(r.decision == "degraded" for r in results)
     final_status = final_result.status.value if final_result is not None else "no_stages"
     content_metrics = _collect_content_metrics(run_dir)
-    final_decision = next(
+    research_decision = next(
         (
             item.decision
             for item in reversed(results)
             if item.stage == Stage.RESEARCH_DECISION
         ),
-        "proceed",
+        None,
     )
+    final_decision = research_decision or "proceed"
     stall_reason: str | None = None
+
+    # Status truthfulness: a pipeline that fails before Stage 15 never made a
+    # research decision.  Do not report the default decision as "proceed" on
+    # terminal failed/paused/blocked runs; surface the terminal state instead.
+    if final_result is not None and research_decision is None:
+        if final_result.status in {
+            StageStatus.FAILED,
+            StageStatus.PAUSED,
+            StageStatus.BLOCKED_APPROVAL,
+            StageStatus.REJECTED,
+        }:
+            final_decision = "blocked" if final_result.decision == "blocked" else final_status
+            if final_result.error:
+                stall_reason = final_result.error
 
     # Fail-closed: degraded + REFINE/PIVOT is not a completed run.
     if (
@@ -119,6 +134,49 @@ def _build_pipeline_summary(
     if stall_reason:
         summary["stall_reason"] = stall_reason
     return summary
+
+
+def _stage14_hard_quality_blocker(run_dir: Path) -> str | None:
+    """Return a stable Stage-14 quality blocker for non-repairable artifacts.
+
+    Nightly ARC must not spend another REFINE loop on experiment outputs whose
+    structured summary already proves the comparison is invalid.  Broken
+    ablation integrity is deterministic evidence that the experiment wiring is
+    bad, not a prose-quality issue for Stage 15 to debate.
+    """
+    candidates = [
+        path for path in (
+            _select_stage14_experiment_summary(run_dir),
+            run_dir / "stage-14" / "experiment_summary.json",
+        ) if path is not None
+    ]
+
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        warnings = data.get("ablation_warnings", []) if isinstance(data, dict) else []
+        if not isinstance(warnings, list):
+            continue
+        hard_warnings = [
+            str(item)
+            for item in warnings
+            if "ABLATION FAILURE" in str(item) or "ZERO VARIANCE" in str(item)
+        ]
+        if hard_warnings:
+            try:
+                rel_path = path.relative_to(run_dir)
+            except ValueError:
+                rel_path = path
+            first = hard_warnings[0]
+            return (
+                "stage-14 experiment quality blocked: ablation integrity failure "
+                f"in {rel_path}: {first[:500]}"
+            )
+    return None
 
 
 def _write_pipeline_summary(run_dir: Path, summary: dict[str, object]) -> None:
@@ -259,6 +317,37 @@ def _collect_content_metrics(run_dir: Path | None) -> dict[str, object]:
 logger = logging.getLogger(__name__)
 
 
+def _latest_by_mtime(paths: list[Path]) -> Path | None:
+    existing = [p for p in paths if p.is_file()]
+    if not existing:
+        return None
+    return max(existing, key=lambda p: p.stat().st_mtime)
+
+
+def _select_stage14_experiment_summary(run_dir: Path) -> Path | None:
+    """Select the authoritative Stage-14 summary.
+
+    Prefer the explicitly promoted best summary, then the current unversioned
+    Stage 14 output, then the newest versioned Stage 14 fallback.  Do not use
+    reverse lexicographic sorting: ``stage-14_v1`` sorts after ``stage-14`` but
+    can be stale after a rollback.
+    """
+    best = run_dir / "experiment_summary_best.json"
+    if best.is_file():
+        return best
+    current = run_dir / "stage-14" / "experiment_summary.json"
+    if current.is_file():
+        return current
+    return _latest_by_mtime(list(run_dir.glob("stage-14_v*/experiment_summary.json")))
+
+
+def _select_stage13_refinement_log(run_dir: Path) -> Path | None:
+    current = run_dir / "stage-13" / "refinement_log.json"
+    if current.is_file():
+        return current
+    return _latest_by_mtime(list(run_dir.glob("stage-13_v*/refinement_log.json")))
+
+
 def _run_experiment_diagnosis(run_dir: Path, config: RCConfig, run_id: str) -> None:
     """Run experiment diagnosis after Stage 14 and save reports.
 
@@ -272,10 +361,7 @@ def _run_experiment_diagnosis(run_dir: Path, config: RCConfig, run_id: str) -> N
             assess_experiment_quality,
         )
 
-        # Find the most recent stage-14 experiment_summary.json
-        summary_path = None
-        for candidate in sorted(run_dir.glob("stage-14*/experiment_summary.json")):
-            summary_path = candidate
+        summary_path = _select_stage14_experiment_summary(run_dir)
         if not summary_path or not summary_path.exists():
             return
 
@@ -316,9 +402,11 @@ def _run_experiment_diagnosis(run_dir: Path, config: RCConfig, run_id: str) -> N
                 except (json.JSONDecodeError, OSError):
                     pass
 
-        # Load refinement log if available
+        # Load refinement log if available. Prefer current/unversioned stage-13
+        # over stale rollback versions.
         ref_log = None
-        for candidate in sorted(run_dir.glob("stage-13*/refinement_log.json")):
+        candidate = _select_stage13_refinement_log(run_dir)
+        if candidate is not None:
             try:
                 ref_log = json.loads(candidate.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
@@ -727,6 +815,26 @@ def execute_pipeline(
                         _run_experiment_repair(run_dir, config, run_id)
                 except (json.JSONDecodeError, OSError):
                     pass
+
+        if stage == Stage.RESULT_ANALYSIS and result.status == StageStatus.DONE:
+            _quality_blocker = _stage14_hard_quality_blocker(run_dir)
+            if _quality_blocker:
+                logger.warning("[%s] %s", run_id, _quality_blocker)
+                print(f"[{run_id}] BLOCKED: {_quality_blocker}")
+                stage_dir = run_dir / f"stage-{int(stage):02d}"
+                stage_dir.mkdir(parents=True, exist_ok=True)
+                (stage_dir / "stall_reason.txt").write_text(
+                    _quality_blocker + "\n", encoding="utf-8"
+                )
+                results[-1] = StageResult(
+                    stage=stage,
+                    status=StageStatus.FAILED,
+                    artifacts=result.artifacts,
+                    error=_quality_blocker,
+                    decision="blocked",
+                    evidence_refs=result.evidence_refs,
+                )
+                break
 
         # --- Heartbeat for sentinel watchdog ---
         if result.status == StageStatus.DONE:
